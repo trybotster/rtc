@@ -1927,6 +1927,44 @@ mod tests {
             .is_some_and(|conn| conn.stream_ids().contains(&id))
     }
 
+    /// Play the round trip Repair 4 waits for. The client flushes what it wants to send (its
+    /// outgoing reset answering the peer's reset), the server processes it and answers, and
+    /// the client reads that answer. Only that answer frees the stream id on the client.
+    fn deliver_reset_answer(
+        ctx: &mut SctpHandlerContext,
+        server_ep: &mut Endpoint,
+        server_conn: &mut Association,
+        now: Instant,
+    ) {
+        let mut sent = vec![];
+        {
+            let mut handler = SctpHandler::new(ctx, 0);
+            while let Some(m) = handler.poll_write() {
+                sent.push(m);
+            }
+        }
+        for m in sent {
+            if let RTCMessageInternal::Dtls(DTLSMessage::Raw(raw)) = m.message
+                && let Some((_, DatagramEvent::AssociationEvent(event))) =
+                    server_ep.handle(now, client_addr(), None, raw.freeze())
+            {
+                server_conn.handle_event(event);
+            }
+        }
+        while server_conn.poll().is_some() {}
+        let answers = drain_transmits(server_conn, now);
+        assert!(
+            answers.iter().any(is_reconfig),
+            "the server must answer the client's reset with a RECONFIG response"
+        );
+        let mut handler = SctpHandler::new(ctx, 0);
+        for d in answers {
+            handler
+                .handle_read(raw_read(now, d))
+                .expect("the answer to our reset");
+        }
+    }
+
     /// Immediate drain, budget above one. The reset overtakes the final DATA datagram, which
     /// UDP permits, so the reset is examined while that data is still unread and is deferred.
     /// The drain triggered by the DATA then reads every message, performs the deferred reset
@@ -1981,8 +2019,18 @@ mod tests {
             "the primed message and the batch must arrive intact, in order, without duplication"
         );
         assert!(
+            client_has_stream(&ctx, ch, 1),
+            "Repair 4: the id stays registered until the peer answers our answering reset"
+        );
+        assert_eq!(
+            stream_closed_events(&ctx, 1),
+            0,
+            "Repair 4: no close is reported while the id is still in use"
+        );
+        deliver_reset_answer(&mut ctx, &mut e.server_ep, &mut e.server_conn, now);
+        assert!(
             !client_has_stream(&ctx, ch, 1),
-            "the deferred reset must have been performed by the drain"
+            "the deferred reset must have been performed by the drain and answered"
         );
         assert!(
             ctx.pending_readable.is_empty(),
@@ -2056,8 +2104,18 @@ mod tests {
             "the parked batch must arrive intact, in order, without duplication"
         );
         assert!(
+            client_has_stream(&ctx, ch, 1),
+            "Repair 4: the id stays registered until the peer answers our answering reset"
+        );
+        assert_eq!(
+            stream_closed_events(&ctx, 1),
+            0,
+            "Repair 4: no close is reported while the id is still in use"
+        );
+        deliver_reset_answer(&mut ctx, &mut e.server_ep, &mut e.server_conn, now);
+        assert!(
             !client_has_stream(&ctx, ch, 1),
-            "the deferred reset must have been performed by the resumed drain"
+            "the deferred reset must have been performed by the resumed drain and answered"
         );
         assert!(
             ctx.pending_readable.is_empty(),
