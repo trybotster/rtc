@@ -27,6 +27,7 @@ use crate::statistics::accumulator::IceCandidateAccumulator;
 use ::sdp::description::session::*;
 use ::sdp::util::ConnectionRole;
 use rand::RngExt;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -167,6 +168,8 @@ impl RTCPeerConnection {
             data_read_outs: VecDeque::new(),
             write_outs: VecDeque::new(),
             event_outs: VecDeque::new(),
+            pending_data_by_channel: HashMap::new(),
+            held_data_channel_closes: VecDeque::new(),
             stats: RTCStatsAccumulator::default(),
         };
 

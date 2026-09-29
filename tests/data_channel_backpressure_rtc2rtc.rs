@@ -456,6 +456,155 @@ async fn accepted_final_payload_precedes_remote_close() -> Result<()> {
     Ok(())
 }
 
+/// The receiver polls events before reads, as the webrtc driver does, and drains every
+/// datagram already at the socket before either poll, as the driver's batch intake does.
+/// When the final payload and the close marker are processed in one intake, the close must
+/// still surface only after the payload has been read.
+#[tokio::test]
+async fn accepted_final_payload_precedes_remote_close_when_events_are_polled_first() -> Result<()> {
+    let mut p = connect().await?;
+    let init = RTCDataChannelInit {
+        ordered: true,
+        negotiated: Some(NEGOTIATED_ID),
+        ..Default::default()
+    };
+    let offer_dc = p
+        .offer_pc
+        .create_data_channel("events-first", Some(init.clone()))?
+        .id();
+    let answer_dc = p
+        .answer_pc
+        .create_data_channel("events-first", Some(init))?
+        .id();
+    let offer = p.offer_pc.create_offer(None)?;
+    p.offer_pc
+        .set_local_description(Instant::now(), offer.clone())?;
+    p.answer_pc.set_remote_description(Instant::now(), offer)?;
+    let answer = p.answer_pc.create_answer(None)?;
+    p.answer_pc
+        .set_local_description(Instant::now(), answer.clone())?;
+    p.offer_pc.set_remote_description(Instant::now(), answer)?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut sent = false;
+    let mut received = Vec::new();
+    let mut remote_closed = false;
+    let mut offer_buf = [0; 2048];
+    let mut answer_buf = [0; 2048];
+    while Instant::now() < deadline && !remote_closed {
+        while let Some(msg) = p.offer_pc.poll_write() {
+            p.offer_socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+        while let Some(msg) = p.answer_pc.poll_write() {
+            p.answer_socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+        let mut queued_now = false;
+        while let Some(event) = p.offer_pc.poll_event() {
+            if matches!(
+                event,
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(_))
+            ) && !sent
+            {
+                let mut channel = p.offer_pc.data_channel(offer_dc).expect("open channel");
+                channel.send_text(Instant::now(), "events-first")?;
+                channel.close()?;
+                sent = true;
+                queued_now = true;
+            }
+        }
+        while p.offer_pc.poll_read().is_some() {}
+        // Receiver: events before reads.
+        while let Some(event) = p.answer_pc.poll_event() {
+            if matches!(
+                event,
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(_))
+            ) {
+                assert_eq!(
+                    received,
+                    vec![b"events-first".to_vec()],
+                    "close surfaced before the accepted payload was readable"
+                );
+                remote_closed = true;
+            }
+        }
+        while let Some(TaggedRTCMessage {
+            message: RTCMessage::DataChannelMessage(id, message),
+            ..
+        }) = p.answer_pc.poll_data_read()
+        {
+            assert_eq!(id, answer_dc);
+            received.push(message.data.to_vec());
+        }
+        if remote_closed {
+            break;
+        }
+        if queued_now {
+            continue;
+        }
+        let next = p
+            .offer_pc
+            .poll_timeout()
+            .unwrap_or(deadline)
+            .min(p.answer_pc.poll_timeout().unwrap_or(deadline))
+            .min(deadline);
+        let incoming = tokio::time::timeout_at(tokio::time::Instant::from_std(next), async {
+            tokio::select! {
+                result = p.offer_socket.recv_from(&mut offer_buf) => {
+                    let (n, peer_addr) = result?;
+                    p.offer_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext { local_addr: p.offer_addr, peer_addr, ecn: None, transport_protocol: TransportProtocol::UDP },
+                        message: bytes::BytesMut::from(&offer_buf[..n]),
+                    })?;
+                }
+                result = p.answer_socket.recv_from(&mut answer_buf) => {
+                    let (n, peer_addr) = result?;
+                    p.answer_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext { local_addr: p.answer_addr, peer_addr, ecn: None, transport_protocol: TransportProtocol::UDP },
+                        message: bytes::BytesMut::from(&answer_buf[..n]),
+                    })?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await;
+        match incoming {
+            Ok(result) => result?,
+            Err(_) => {
+                p.offer_pc.handle_timeout(Instant::now())?;
+                p.answer_pc.handle_timeout(Instant::now())?;
+            }
+        }
+        // Batch intake: everything already at the receiver's socket joins this pass, so a
+        // payload datagram and a close datagram sent together are processed together.
+        while let Ok((n, peer_addr)) = p.answer_socket.try_recv_from(&mut answer_buf) {
+            p.answer_pc.handle_read(TaggedBytesMut {
+                now: Instant::now(),
+                transport: TransportContext {
+                    local_addr: p.answer_addr,
+                    peer_addr,
+                    ecn: None,
+                    transport_protocol: TransportProtocol::UDP,
+                },
+                message: bytes::BytesMut::from(&answer_buf[..n]),
+            })?;
+        }
+    }
+    p.offer_pc.close()?;
+    p.answer_pc.close()?;
+    assert!(sent, "the channel must open and accept the payload");
+    assert!(
+        remote_closed,
+        "the receiver must observe close within the deadline"
+    );
+    assert_eq!(received, vec![b"events-first".to_vec()]);
+    Ok(())
+}
+
 /// Hub's WebRTC transport sets no wrapper send-buffer limit. Its production pressure
 /// signal is `OnBufferedAmountHigh` at `LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH`, two Hub
 /// maximum frames of 64 KiB. This test raises that signal on a real peer while the
