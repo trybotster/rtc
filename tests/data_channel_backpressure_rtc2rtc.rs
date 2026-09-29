@@ -321,3 +321,351 @@ async fn test_slow_consumer_throttles_the_peer_without_losing_data() -> Result<(
     p.answer_pc.close()?;
     Ok(())
 }
+
+#[tokio::test]
+async fn accepted_final_payload_precedes_remote_close() -> Result<()> {
+    let mut p = connect().await?;
+    let init = RTCDataChannelInit {
+        ordered: true,
+        negotiated: Some(NEGOTIATED_ID),
+        ..Default::default()
+    };
+    // `NEGOTIATED_ID` is the wire stream id. The public handle each side addresses its
+    // channel by, and that its events and messages carry, comes from `create_data_channel`.
+    let offer_dc = p
+        .offer_pc
+        .create_data_channel("final-payload", Some(init.clone()))?
+        .id();
+    let answer_dc = p
+        .answer_pc
+        .create_data_channel("final-payload", Some(init))?
+        .id();
+    let offer = p.offer_pc.create_offer(None)?;
+    p.offer_pc
+        .set_local_description(Instant::now(), offer.clone())?;
+    p.answer_pc.set_remote_description(Instant::now(), offer)?;
+    let answer = p.answer_pc.create_answer(None)?;
+    p.answer_pc
+        .set_local_description(Instant::now(), answer.clone())?;
+    p.offer_pc.set_remote_description(Instant::now(), answer)?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut sent = false;
+    let mut received = Vec::new();
+    let mut remote_closed = false;
+    let mut offer_buf = [0; 2048];
+    let mut answer_buf = [0; 2048];
+    while Instant::now() < deadline && !remote_closed {
+        while let Some(msg) = p.offer_pc.poll_write() {
+            p.offer_socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+        while let Some(msg) = p.answer_pc.poll_write() {
+            p.answer_socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+        let mut queued_now = false;
+        while let Some(event) = p.offer_pc.poll_event() {
+            if matches!(
+                event,
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(_))
+            ) && !sent
+            {
+                let mut channel = p.offer_pc.data_channel(offer_dc).expect("open channel");
+                channel.send_text(Instant::now(), "final-payload")?;
+                // Do not drive pipeline writes between acceptance and close.
+                channel.close()?;
+                sent = true;
+                queued_now = true;
+            }
+        }
+        while p.offer_pc.poll_read().is_some() {}
+        while let Some(TaggedRTCMessage {
+            message: RTCMessage::DataChannelMessage(id, message),
+            ..
+        }) = p.answer_pc.poll_read()
+        {
+            assert_eq!(id, answer_dc);
+            received.push(message.data.to_vec());
+        }
+        while let Some(event) = p.answer_pc.poll_event() {
+            if matches!(
+                event,
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(_))
+            ) {
+                assert_eq!(
+                    received,
+                    vec![b"final-payload".to_vec()],
+                    "payload must reach the receiver before close"
+                );
+                remote_closed = true;
+            }
+        }
+        if remote_closed {
+            break;
+        }
+        if queued_now {
+            continue;
+        }
+        let next = p
+            .offer_pc
+            .poll_timeout()
+            .unwrap_or(deadline)
+            .min(p.answer_pc.poll_timeout().unwrap_or(deadline))
+            .min(deadline);
+        // This deadline drives protocol timers. It does not delay application close.
+        let incoming = tokio::time::timeout_at(tokio::time::Instant::from_std(next), async {
+            tokio::select! {
+                result = p.offer_socket.recv_from(&mut offer_buf) => {
+                    let (n, peer_addr) = result?;
+                    p.offer_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext { local_addr: p.offer_addr, peer_addr, ecn: None, transport_protocol: TransportProtocol::UDP },
+                        message: bytes::BytesMut::from(&offer_buf[..n]),
+                    })?;
+                }
+                result = p.answer_socket.recv_from(&mut answer_buf) => {
+                    let (n, peer_addr) = result?;
+                    p.answer_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext { local_addr: p.answer_addr, peer_addr, ecn: None, transport_protocol: TransportProtocol::UDP },
+                        message: bytes::BytesMut::from(&answer_buf[..n]),
+                    })?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await;
+        match incoming {
+            Ok(result) => result?,
+            Err(_) => {
+                p.offer_pc.handle_timeout(Instant::now())?;
+                p.answer_pc.handle_timeout(Instant::now())?;
+            }
+        }
+    }
+    p.offer_pc.close()?;
+    p.answer_pc.close()?;
+    assert!(sent, "the channel must open and accept the payload");
+    assert!(
+        remote_closed,
+        "the receiver must observe close within the deadline"
+    );
+    assert_eq!(received, vec![b"final-payload".to_vec()]);
+    Ok(())
+}
+
+/// Hub's WebRTC transport sets no wrapper send-buffer limit. Its production pressure
+/// signal is `OnBufferedAmountHigh` at `LOCAL_WEBRTC_BUFFERED_AMOUNT_HIGH`, two Hub
+/// maximum frames of 64 KiB. This test raises that signal on a real peer while the
+/// receiver stalls, accepts one more payload under pressure, closes at once, and
+/// requires every accepted payload at the receiver before the remote close.
+const HUB_BUFFERED_AMOUNT_HIGH: u32 = 2 * 64 * 1024;
+
+const PRESSURE_PAYLOAD_BYTES: usize = 32 * 1024;
+
+const PRESSURE_PAYLOAD_CAP: usize = 256;
+
+#[tokio::test]
+async fn accepted_payload_under_pressure_precedes_remote_close() -> Result<()> {
+    let mut p = connect().await?;
+    let init = RTCDataChannelInit {
+        ordered: true,
+        negotiated: Some(NEGOTIATED_ID),
+        ..Default::default()
+    };
+    let offer_dc = p
+        .offer_pc
+        .create_data_channel("pressure-close", Some(init.clone()))?
+        .id();
+    let answer_dc = p
+        .answer_pc
+        .create_data_channel("pressure-close", Some(init))?
+        .id();
+    let offer = p.offer_pc.create_offer(None)?;
+    p.offer_pc
+        .set_local_description(Instant::now(), offer.clone())?;
+    p.answer_pc.set_remote_description(Instant::now(), offer)?;
+    let answer = p.answer_pc.create_answer(None)?;
+    p.answer_pc
+        .set_local_description(Instant::now(), answer.clone())?;
+    p.offer_pc.set_remote_description(Instant::now(), answer)?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut open = false;
+    let mut high_seen = false;
+    let mut pressure_active = false;
+    let mut close_sent = false;
+    let mut remote_closed = false;
+    let mut consuming = false;
+    let mut sent: Vec<Vec<u8>> = Vec::new();
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    let mut offer_buf = [0; 2048];
+    let mut answer_buf = [0; 2048];
+    while Instant::now() < deadline && !remote_closed {
+        while let Some(msg) = p.offer_pc.poll_write() {
+            p.offer_socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+        while let Some(msg) = p.answer_pc.poll_write() {
+            p.answer_socket
+                .send_to(&msg.message, msg.transport.peer_addr)
+                .await?;
+        }
+        while let Some(event) = p.offer_pc.poll_event() {
+            match event {
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnOpen(_)) => {
+                    let mut channel = p.offer_pc.data_channel(offer_dc).expect("open channel");
+                    channel.set_buffered_amount_high_threshold(HUB_BUFFERED_AMOUNT_HIGH);
+                    open = true;
+                }
+                RTCPeerConnectionEvent::OnDataChannel(
+                    RTCDataChannelEvent::OnBufferedAmountHigh(_),
+                ) => {
+                    high_seen = true;
+                    pressure_active = true;
+                }
+                RTCPeerConnectionEvent::OnDataChannel(
+                    RTCDataChannelEvent::OnBufferedAmountLow(_),
+                ) => {
+                    pressure_active = false;
+                }
+                _ => {}
+            }
+        }
+        while p.offer_pc.poll_read().is_some() {}
+        // The receiver stalls until the close is queued, so pressure builds on the sender.
+        if consuming {
+            while let Some(TaggedRTCMessage {
+                message: RTCMessage::DataChannelMessage(id, message),
+                ..
+            }) = p.answer_pc.poll_read()
+            {
+                assert_eq!(id, answer_dc);
+                received.push(message.data.to_vec());
+            }
+        }
+        while let Some(event) = p.answer_pc.poll_event() {
+            if matches!(
+                event,
+                RTCPeerConnectionEvent::OnDataChannel(RTCDataChannelEvent::OnClose(_))
+            ) {
+                assert_eq!(
+                    received.len(),
+                    sent.len(),
+                    "every accepted payload must reach the receiver before close"
+                );
+                assert_eq!(
+                    received, sent,
+                    "accepted payload must arrive intact and in order"
+                );
+                remote_closed = true;
+            }
+        }
+        if remote_closed {
+            break;
+        }
+        let mut queued_now = false;
+        if open && !close_sent {
+            let mut channel = p.offer_pc.data_channel(offer_dc).expect("open channel");
+            if !high_seen {
+                assert!(
+                    sent.len() < PRESSURE_PAYLOAD_CAP,
+                    "the sender never reached the Hub high-water threshold"
+                );
+                let mut payload = vec![0u8; PRESSURE_PAYLOAD_BYTES];
+                payload[..8].copy_from_slice(&(sent.len() as u64).to_be_bytes());
+                // Hub configures no wrapper send-buffer limit, so every send must be
+                // accepted; an error here is a real failure, not back-pressure.
+                channel.send(Instant::now(), bytes::BytesMut::from(&payload[..]))?;
+                sent.push(payload);
+            } else {
+                // Pressure must still be active at this instant: the high-water event
+                // has not been followed by low-water, and unreleased bytes stay at or
+                // above the Hub threshold.
+                let outstanding = channel.outstanding_bytes();
+                assert!(
+                    pressure_active && outstanding >= HUB_BUFFERED_AMOUNT_HIGH as usize,
+                    "pressure lapsed before the final send: pressure_active={pressure_active} outstanding={outstanding} threshold={HUB_BUFFERED_AMOUNT_HIGH}"
+                );
+                // Accepted under pressure, then closed with no pipeline write in between.
+                let payload = b"final-under-pressure".to_vec();
+                channel.send(Instant::now(), bytes::BytesMut::from(&payload[..]))?;
+                sent.push(payload);
+                channel.close()?;
+                close_sent = true;
+                consuming = true;
+                queued_now = true;
+            }
+        }
+        if queued_now {
+            continue;
+        }
+        let next = p
+            .offer_pc
+            .poll_timeout()
+            .unwrap_or(deadline)
+            .min(p.answer_pc.poll_timeout().unwrap_or(deadline))
+            .min(deadline);
+        let delay = next
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(5));
+        if delay.is_zero() {
+            p.offer_pc.handle_timeout(Instant::now())?;
+            p.answer_pc.handle_timeout(Instant::now())?;
+            continue;
+        }
+        let incoming = tokio::time::timeout(delay, async {
+            tokio::select! {
+                result = p.offer_socket.recv_from(&mut offer_buf) => {
+                    let (n, peer_addr) = result?;
+                    p.offer_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext { local_addr: p.offer_addr, peer_addr, ecn: None, transport_protocol: TransportProtocol::UDP },
+                        message: bytes::BytesMut::from(&offer_buf[..n]),
+                    })?;
+                }
+                result = p.answer_socket.recv_from(&mut answer_buf) => {
+                    let (n, peer_addr) = result?;
+                    p.answer_pc.handle_read(TaggedBytesMut {
+                        now: Instant::now(),
+                        transport: TransportContext { local_addr: p.answer_addr, peer_addr, ecn: None, transport_protocol: TransportProtocol::UDP },
+                        message: bytes::BytesMut::from(&answer_buf[..n]),
+                    })?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+        match incoming {
+            Ok(result) => result?,
+            Err(_) => {
+                p.offer_pc.handle_timeout(Instant::now())?;
+                p.answer_pc.handle_timeout(Instant::now())?;
+            }
+        }
+    }
+    p.offer_pc.close()?;
+    p.answer_pc.close()?;
+    assert!(open, "the channel must open");
+    assert!(
+        high_seen,
+        "the sender must observe OnBufferedAmountHigh at the Hub threshold"
+    );
+    assert!(
+        close_sent,
+        "the sender must accept one payload under pressure and close"
+    );
+    assert!(
+        remote_closed,
+        "the receiver must observe close within the deadline"
+    );
+    assert!(
+        sent.len() >= 2,
+        "at least one pressured payload and the final payload must be accepted"
+    );
+    assert_eq!(received, sent);
+    Ok(())
+}

@@ -30,7 +30,7 @@ pub(crate) struct DataChannelHandlerContext {
     /// there from an earlier `handle_*` — the datachannel layer buffers when SCTP back-pressures
     /// it. Stamping those with the instant of the input that caused them is the right answer;
     /// this field is what a `poll_*` has instead of a parameter.
-    now: Instant,
+    pub(crate) now: Instant,
 }
 
 impl DataChannelHandlerContext {
@@ -301,6 +301,13 @@ impl<'a>
 
         if let RTCMessageInternal::Dtls(DTLSMessage::DataChannel(message)) = msg.message {
             debug!("send application message {:?}", msg.transport.peer_addr);
+
+            if matches!(message.data_channel_event, DataChannelEvent::Close) {
+                if let Some(channel) = self.data_channels.get_mut(&message.data_channel_id) {
+                    channel.close()?;
+                }
+                return Ok(());
+            }
 
             if let DataChannelEvent::Message(RTCDataChannelMessage { is_string, data }) =
                 message.data_channel_event

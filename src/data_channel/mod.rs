@@ -36,9 +36,13 @@
 //! * [RFC 8832 - WebRTC Data Channel Establishment Protocol](https://www.rfc-editor.org/rfc/rfc8832.html)
 
 use crate::peer_connection::RTCPeerConnection;
+use crate::peer_connection::message::internal::{
+    ApplicationMessage, DTLSMessage, DataChannelEvent, RTCMessageInternal, TaggedRTCMessageInternal,
+};
 use crate::peer_connection::message::{RTCMessage, TaggedRTCMessage};
 use bytes::BytesMut;
 use sansio::Protocol;
+use shared::TransportContext;
 use shared::error::{Error, Result};
 use std::time::Instant;
 
@@ -302,6 +306,13 @@ impl RTCDataChannel<'_> {
             .get(&self.id)
             .ok_or(Error::ErrDataChannelClosed)?;
 
+        if matches!(
+            dc.ready_state,
+            RTCDataChannelState::Closing | RTCDataChannelState::Closed
+        ) {
+            return Err(Error::ErrDataChannelClosed);
+        }
+
         if dc.data_channel.is_none() {
             // No stream yet: either it is still being negotiated, or it is already gone.
             return Err(if dc.ready_state == RTCDataChannelState::Connecting {
@@ -379,11 +390,31 @@ impl RTCDataChannel<'_> {
     /// Closes the data channel.
     pub fn close(&mut self) -> Result<()> {
         if let Some(dc) = self.peer_connection.data_channels.get_mut(&self.id) {
-            if dc.ready_state == RTCDataChannelState::Closed {
+            if matches!(
+                dc.ready_state,
+                RTCDataChannelState::Closing | RTCDataChannelState::Closed
+            ) {
                 return Ok(());
             }
             dc.ready_state = RTCDataChannelState::Closing;
-            dc.close()
+            // Queue close after accepted payload. Internal abort paths remain immediate.
+            let now = self
+                .peer_connection
+                .pipeline_context
+                .datachannel_handler_context
+                .now;
+            self.peer_connection
+                .get_endpoint_handler()
+                .handle_write(TaggedRTCMessageInternal {
+                    now,
+                    transport: TransportContext::default(),
+                    message: RTCMessageInternal::Dtls(DTLSMessage::DataChannel(
+                        ApplicationMessage {
+                            data_channel_id: self.id,
+                            data_channel_event: DataChannelEvent::Close,
+                        },
+                    )),
+                })
         } else {
             Err(Error::ErrDataChannelClosed)
         }

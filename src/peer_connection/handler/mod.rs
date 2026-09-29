@@ -651,3 +651,194 @@ mod handler_test {
         assert_ne!(queued.now, t(0), "and not the construction instant either");
     }
 }
+
+#[cfg(test)]
+mod botster_enqueue_close_probe {
+    use super::*;
+    use crate::data_channel::internal::RTCDataChannelInternal;
+    use crate::data_channel::parameters::DataChannelParameters;
+    use crate::peer_connection::RTCPeerConnectionBuilder;
+    use crate::peer_connection::configuration::RTCConfigurationBuilder;
+    use ::datachannel::message::Message;
+    use ::sctp::PayloadProtocolIdentifier;
+    use sansio::Protocol;
+    use shared::marshal::Unmarshal;
+    use std::time::Instant;
+
+    fn order(advance_before_close: bool) -> Vec<&'static str> {
+        let now = Instant::now();
+        let mut pc = RTCPeerConnectionBuilder::new()
+            .with_configuration(RTCConfigurationBuilder::new().build())
+            .build(now)
+            .unwrap();
+        let mut dc = RTCDataChannelInternal::new(
+            1,
+            DataChannelParameters {
+                label: "enqueue-close-probe".to_owned(),
+                protocol: String::new(),
+                ordered: true,
+                max_packet_life_time: None,
+                max_retransmits: None,
+                negotiated: Some(1),
+            },
+        );
+        // This check establishes only the local queue path. It creates no peer.
+        dc.dial(0).unwrap();
+        pc.data_channels.insert(1, dc);
+        while pc.get_datachannel_handler().poll_write().is_some() {}
+        pc.data_channel(1)
+            .unwrap()
+            .send_text(now, "exit-probe")
+            .unwrap();
+        if advance_before_close {
+            let queued = pc.get_endpoint_handler().poll_write().unwrap();
+            pc.get_datachannel_handler().handle_write(queued).unwrap();
+        }
+        pc.data_channel(1).unwrap().close().unwrap();
+        pc.data_channel(1).unwrap().close().unwrap();
+        assert!(matches!(
+            pc.data_channel(1).unwrap().send_text(now, "late"),
+            Err(shared::error::Error::ErrDataChannelClosed)
+        ));
+        while let Some(queued) = pc.get_endpoint_handler().poll_write() {
+            pc.get_datachannel_handler().handle_write(queued).unwrap();
+        }
+        let mut order = Vec::new();
+        while let Some(message) = pc.get_datachannel_handler().poll_write() {
+            if let RTCMessageInternal::Dtls(DTLSMessage::Sctp(message)) = message.message {
+                if message.ppi == PayloadProtocolIdentifier::Dcep {
+                    let mut payload = &message.payload[..];
+                    if matches!(
+                        Message::unmarshal(&mut payload).unwrap(),
+                        Message::DataChannelClose(_)
+                    ) {
+                        order.push("close");
+                    }
+                } else {
+                    assert_eq!(&message.payload[..], b"exit-probe");
+                    order.push("payload");
+                }
+            }
+            assert!(order.len() <= 2);
+        }
+        order
+    }
+
+    /// Public close while the in-band channel is still `Connecting`: the DCEP OPEN is
+    /// still queued, a late ACK arrives while the close is queued behind it, and the
+    /// channel must end Closed with exactly one close marker after the open marker.
+    #[test]
+    fn public_close_before_open_ignores_late_ack_and_orders_close_after_open() {
+        use crate::data_channel::state::RTCDataChannelState;
+        use crate::peer_connection::event::data_channel_event::RTCDataChannelEvent;
+        use crate::peer_connection::message::internal::{
+            DTLSMessage, RTCMessageInternal, TaggedRTCMessageInternal,
+        };
+        use ::datachannel::data_channel::DataChannelMessage;
+        use ::datachannel::message::message_channel_ack::DataChannelAck;
+        use ::datachannel::message::message_channel_threshold::DataChannelThreshold;
+        use bytes::BytesMut;
+        use shared::TransportContext;
+        use shared::marshal::Marshal;
+
+        let now = Instant::now();
+        let mut pc = RTCPeerConnectionBuilder::new()
+            .with_configuration(RTCConfigurationBuilder::new().build())
+            .build(now)
+            .unwrap();
+        let mut dc = RTCDataChannelInternal::new(
+            1,
+            DataChannelParameters {
+                label: "close-before-open".to_owned(),
+                protocol: String::new(),
+                ordered: true,
+                max_packet_life_time: None,
+                max_retransmits: None,
+                negotiated: None,
+            },
+        );
+        dc.dial(0).unwrap();
+        pc.data_channels.insert(1, dc);
+        // Nothing is drained: the DCEP OPEN stays queued when the public close runs.
+        pc.data_channel(1).unwrap().close().unwrap();
+        pc.data_channel(1).unwrap().close().unwrap();
+        assert!(matches!(
+            pc.data_channel(1).unwrap().send_text(now, "late"),
+            Err(shared::error::Error::ErrDataChannelClosed)
+        ));
+        // A late ACK reaches the handler while the queued close is still pending.
+        let ack = Message::DataChannelAck(DataChannelAck {})
+            .marshal()
+            .unwrap();
+        pc.get_datachannel_handler()
+            .handle_read(TaggedRTCMessageInternal {
+                now,
+                transport: TransportContext::default(),
+                message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(DataChannelMessage {
+                    association_handle: 0,
+                    stream_id: 1,
+                    ppi: PayloadProtocolIdentifier::Dcep,
+                    payload: BytesMut::from(&ack[..]),
+                    negotiated: false,
+                })),
+            })
+            .unwrap();
+        while let Some(queued) = pc.get_endpoint_handler().poll_write() {
+            pc.get_datachannel_handler().handle_write(queued).unwrap();
+        }
+        assert_eq!(
+            pc.data_channels.get(&1).unwrap().ready_state,
+            RTCDataChannelState::Closed
+        );
+        let mut opens = 0;
+        while let Some(event) = pc.get_datachannel_handler().poll_event() {
+            if matches!(
+                event.event,
+                RTCEventInternal::RTCPeerConnectionEvent(RTCPeerConnectionEvent::OnDataChannel(
+                    RTCDataChannelEvent::OnOpen(_)
+                ))
+            ) {
+                opens += 1;
+            }
+        }
+        assert_eq!(opens, 0, "a late ACK must not open a closing channel");
+        // `RTCDataChannelInternal::dial` queues the DCEP OPEN and then the low and
+        // high threshold controls (`write_data_channel_low_threshold`,
+        // `write_data_channel_high_threshold` in rtc-datachannel). The queued close
+        // must follow all three; any other marker is a defect.
+        let mut order = Vec::new();
+        while let Some(message) = pc.get_datachannel_handler().poll_write() {
+            if let RTCMessageInternal::Dtls(DTLSMessage::Sctp(message)) = message.message {
+                assert_eq!(message.ppi, PayloadProtocolIdentifier::Dcep);
+                let mut payload = &message.payload[..];
+                order.push(match Message::unmarshal(&mut payload).unwrap() {
+                    Message::DataChannelOpen(_) => "open",
+                    Message::DataChannelThreshold(DataChannelThreshold::Low(_)) => "threshold-low",
+                    Message::DataChannelThreshold(DataChannelThreshold::High(_)) => {
+                        "threshold-high"
+                    }
+                    Message::DataChannelClose(_) => "close",
+                    other => panic!("unexpected DCEP marker before close: {other:?}"),
+                });
+            }
+        }
+        assert_eq!(
+            order,
+            ["open", "threshold-low", "threshold-high", "close"],
+            "one close marker after the open marker and the dial threshold controls"
+        );
+    }
+
+    #[test]
+    fn enqueue_then_close_preserves_payload_order() {
+        let advanced = order(true);
+        let queued = order(false);
+        eprintln!("advanced_before_close={advanced:?}; queued_before_close={queued:?}");
+        assert_eq!(advanced, ["payload", "close"], "control path");
+        assert_eq!(
+            queued,
+            ["payload", "close"],
+            "accepted payload must precede close"
+        );
+    }
+}
