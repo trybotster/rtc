@@ -263,6 +263,7 @@ impl Stream<'_> {
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
             if s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable {
                 reset = true;
+                s.outgoing_reset = OutgoingReset::Requested;
             }
             s.state = ((s.state as u8) & 0x2).into();
         }
@@ -434,7 +435,26 @@ pub struct StreamState {
     pub(crate) buffered_amount: usize,
     pub(crate) buffered_amount_low: usize,
     pub(crate) buffered_amount_high: usize,
+    /// Botster repair: the RFC 8831 §6.7 close handshake. The stream stays
+    /// registered, and its id unavailable, until both directions are reset:
+    /// the peer's reset of its outgoing direction was performed here
+    /// (`incoming_reset`), and our reset of our outgoing direction was answered
+    /// (`OutgoingReset::Performed`).
+    pub(crate) outgoing_reset: OutgoingReset,
+    pub(crate) incoming_reset: bool,
 }
+
+/// Where our reset of a stream's outgoing direction stands (RFC 6525).
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum OutgoingReset {
+    #[default]
+    NotRequested,
+    /// Queued or sent, and not yet answered with a final result.
+    Requested,
+    /// The peer answered our request with a final result.
+    Performed,
+}
+
 impl StreamState {
     pub(crate) fn new(
         side: Side,
@@ -456,6 +476,8 @@ impl StreamState {
             buffered_amount: 0,
             buffered_amount_low: 0,
             buffered_amount_high: u32::MAX as usize,
+            outgoing_reset: OutgoingReset::NotRequested,
+            incoming_reset: false,
         }
     }
 
