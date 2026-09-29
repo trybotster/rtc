@@ -30,7 +30,7 @@ use crate::util::{constant_time_eq, sna16lt, sna32gt, sna32gte, sna32lt, sna32lt
 use crate::{AssociationEvent, Payload, Side};
 use shared::error::{Error, Result};
 use shared::{TransportContext, TransportMessage, TransportProtocol};
-use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
+use stream::{OutgoingReset, ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;
@@ -957,7 +957,7 @@ impl Association {
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkSelectiveAck>() {
             self.handle_sack(c, now)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkReconfig>() {
-            self.handle_reconfig(c)?
+            self.handle_reconfig(c, now)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkForwardTsn>() {
             self.handle_forward_tsn(c)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkShutdown>() {
@@ -1273,6 +1273,20 @@ impl Association {
         let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
         let mut stream_handle_data = false;
         if can_push {
+            // Botster repair: new data on a stream whose incoming direction the peer
+            // already reset belongs to a new stream on the same id. The peer reuses an id
+            // only after performing our reset of it, so that reset is complete even if its
+            // answer has not arrived: retire the old stream, and let this data open the new.
+            if self
+                .streams
+                .get(&d.stream_identifier)
+                .is_some_and(|s| s.incoming_reset)
+            {
+                self.unregister_stream(d.stream_identifier, AssociationError::Reset);
+                // The old stream's reset request is over with it. A delayed answer must
+                // not be applied to the replacement stream that now owns this id.
+                self.retire_pending_outgoing_reset(d.stream_identifier);
+            }
             if self.get_or_create_stream(d.stream_identifier).is_some() {
                 if self.get_my_receiver_window_credit() > 0 {
                     // Pass the new chunk to stream level as soon as it arrives
@@ -1501,17 +1515,17 @@ impl Association {
         Ok(vec![])
     }
 
-    fn handle_reconfig(&mut self, c: &ChunkReconfig) -> Result<Vec<Packet>> {
+    fn handle_reconfig(&mut self, c: &ChunkReconfig, now: Instant) -> Result<Vec<Packet>> {
         trace!("[{}] handle_reconfig", self.side);
 
         let mut pp = vec![];
 
         if let Some(param_a) = &c.param_a {
-            self.handle_reconfig_param(param_a, &mut pp)?;
+            self.handle_reconfig_param(param_a, &mut pp, now)?;
         }
 
         if let Some(param_b) = &c.param_b {
-            self.handle_reconfig_param(param_b, &mut pp)?;
+            self.handle_reconfig_param(param_b, &mut pp, now)?;
         }
 
         Ok(pp)
@@ -1710,6 +1724,7 @@ impl Association {
         &mut self,
         raw: &Box<dyn Param>,
         reply: &mut Vec<Packet>,
+        now: Instant,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
             self.reconfig_requests
@@ -1717,7 +1732,32 @@ impl Association {
             self.reset_streams_if_any(p, true, reply)?;
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
-            self.reconfigs.remove(&p.reconfig_response_sequence_number);
+            let rsn = p.reconfig_response_sequence_number;
+            if p.result == ReconfigResult::InProgress {
+                // Botster repair: RFC 6525 §5.2.7, "If the Result field indicates 'In
+                // progress', the timer for the Re-configuration Request Sequence Number is
+                // started again." The request stays for retransmission; the reset it asks
+                // for has not been performed yet.
+                if self.reconfigs.contains_key(&rsn) {
+                    self.timers.stop(Timer::Reconfig);
+                    self.timers
+                        .start(Timer::Reconfig, now, self.rto_mgr.get_rto());
+                }
+                return Ok(());
+            }
+            if let Some(answered) = self.reconfigs.remove(&rsn) {
+                // Botster repair: RFC 6525 §5.2.7 stops processing on an unsuccessful
+                // result. Only a success (performed, or nothing to do because the reset
+                // already happened) completes our outgoing reset. After any other final
+                // result the request is over as before, but the stream stays registered:
+                // its id is not reusable, because the peer did not reset that direction.
+                if matches!(
+                    p.result,
+                    ReconfigResult::SuccessPerformed | ReconfigResult::SuccessNop
+                ) {
+                    self.complete_outgoing_reset(&answered);
+                }
+            }
             if self.reconfigs.is_empty() {
                 self.timers.stop(Timer::Reconfig);
             }
@@ -2064,11 +2104,28 @@ impl Association {
                 if draining.contains(id) {
                     continue;
                 }
-                if self.streams.contains_key(id) {
-                    if respond {
+                // Botster repair: RFC 8831 §6.7. The peer reset its outgoing direction.
+                // Reset ours in answer only if it is not already reset or being reset: a
+                // request that merely answers our own reset must not start another one (a
+                // second reset of this id would reach the peer after the peer may have reused
+                // the id, and close the new stream). The stream closes, and its id becomes
+                // reusable, only once both directions are reset.
+                let Some(s) = self.streams.get_mut(id) else {
+                    continue;
+                };
+                s.incoming_reset = true;
+                match s.outgoing_reset {
+                    OutgoingReset::NotRequested if respond => {
+                        s.outgoing_reset = OutgoingReset::Requested;
+                        s.state = RecvSendState::Closed;
                         sis_to_reset.push(*id);
                     }
-                    self.unregister_stream(*id, AssociationError::Reset);
+                    OutgoingReset::Requested => {
+                        s.state = RecvSendState::Closed;
+                    }
+                    OutgoingReset::NotRequested | OutgoingReset::Performed => {
+                        self.unregister_stream(*id, AssociationError::Reset);
+                    }
                 }
             }
 
@@ -2125,6 +2182,59 @@ impl Association {
         reply.push(packet);
 
         Ok(())
+    }
+
+    /// Botster repair: forget a stream id in our pending outgoing reset requests. The
+    /// stream that request was for has been retired, so an answer to it, arriving late,
+    /// must not match whatever stream is registered under the id next. A request that
+    /// names no other stream is dropped, with its retransmission timer if it was the last.
+    fn retire_pending_outgoing_reset(&mut self, id: StreamId) {
+        let mut emptied = vec![];
+        for (rsn, c) in self.reconfigs.iter_mut() {
+            let Some(mut request) = c
+                .param_a
+                .as_ref()
+                .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                .filter(|request| request.stream_identifiers.contains(&id))
+                .cloned()
+            else {
+                continue;
+            };
+            request.stream_identifiers.retain(|named| *named != id);
+            if request.stream_identifiers.is_empty() {
+                emptied.push(*rsn);
+            } else {
+                c.param_a = Some(Box::new(request));
+            }
+        }
+        for rsn in emptied {
+            self.reconfigs.remove(&rsn);
+        }
+        if self.reconfigs.is_empty() {
+            self.timers.stop(Timer::Reconfig);
+        }
+    }
+
+    /// Botster repair: the peer answered our outgoing reset request with a success.
+    /// Each stream it named has both directions reset once the peer's own
+    /// reset was performed here; only then is it unregistered, which frees its id.
+    fn complete_outgoing_reset(&mut self, answered: &ChunkReconfig) {
+        let Some(request) = answered
+            .param_a
+            .as_ref()
+            .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        else {
+            return;
+        };
+        for id in &request.stream_identifiers {
+            let Some(s) = self.streams.get_mut(id) else {
+                continue;
+            };
+            s.outgoing_reset = OutgoingReset::Performed;
+            if s.incoming_reset {
+                self.unregister_stream(*id, AssociationError::Reset);
+            }
+        }
     }
 
     /// create_packet wraps chunks in a packet.
