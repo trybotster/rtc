@@ -2743,6 +2743,17 @@ fn test_association_shutdown_during_write() -> Result<()> {
 
 use crate::association::stream::StreamEvent;
 
+/// One round trip of the reset handshake, after the receiver has applied the peer's reset: the
+/// receiver sends its own answering reset, the peer answers it, and the receiver reads that
+/// answer. The receiver keeps the stream registered until then (RFC 8831 section 6.7: a stream id
+/// is reusable only after both directions of its reset complete), so tests that assert the stream
+/// is gone run this first.
+fn complete_reset_handshake(pair: &mut Pair) {
+    pair.drive_server();
+    pair.drive_client();
+    pair.drive_server();
+}
+
 /// Deliver every queued inbound packet to the server ONE AT A TIME, and after
 /// each one poll association events and drain every `Readable` stream
 /// immediately — exactly what `rtc`'s SCTP handler does
@@ -2843,6 +2854,7 @@ fn kps_816_write_then_reset_delivered_in_order_survives() -> Result<()> {
     // would prove nothing.
     let n_packets = pair.server.inbound.len();
     let (delivered, errors) = deliver_to_server_rtc_style(&mut pair, server_ch);
+    complete_reset_handshake(&mut pair);
     let stream_after = pair.server_conn_mut(server_ch).stream(si).is_ok();
 
     println!("inbound packets carrying write+reset = {n_packets}");
@@ -2930,6 +2942,7 @@ fn kps_repro_816_bundled_data_and_reset_must_not_lose_data() -> Result<()> {
 
     let n_packets = pair.server.inbound.len();
     let (delivered, errors) = deliver_to_server_rtc_style(&mut pair, server_ch);
+    complete_reset_handshake(&mut pair);
     let stream_after = pair.server_conn_mut(server_ch).stream(si).is_ok();
 
     println!("inbound packets = {n_packets}");
@@ -2998,6 +3011,7 @@ fn kps_repro_816_reordered_reset_before_data_must_not_lose_data() -> Result<()> 
     pair.server.inbound.extend(pkts);
 
     let (delivered, errors) = deliver_to_server_rtc_style(&mut pair, server_ch);
+    complete_reset_handshake(&mut pair);
     let stream_after = pair.server_conn_mut(server_ch).stream(si).is_ok();
 
     println!("server still has stream {si} afterwards = {stream_after}");
@@ -3130,6 +3144,13 @@ fn kps_816_deferred_reset_completes_when_the_application_drains() -> Result<()> 
     let _ = pair
         .server_stream(server_ch, si)
         .and_then(|mut s| s.read_sctp());
+    // The reset is performed; the stream stays registered until the peer answers our
+    // answering reset, so its id is not reusable earlier.
+    assert!(
+        pair.server_conn_mut(server_ch).stream(si).is_ok(),
+        "the id stays registered until the peer answers the answering reset"
+    );
+    complete_reset_handshake(&mut pair);
     assert!(
         pair.server_conn_mut(server_ch).stream(si).is_err(),
         "once drained, the deferred reset must be performed"

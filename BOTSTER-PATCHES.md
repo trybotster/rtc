@@ -104,6 +104,15 @@ processing on an unsuccessful result and restarts the timer on "In progress".
   stream's pending reset request is retired with it, so a delayed answer cannot touch the replacement.
 - An answering reset request has its retransmission timer armed in the transmit pass.
 
+Four existing `rtc-sctp` endpoint tests (`kps_816_write_then_reset_delivered_in_order_survives`,
+`kps_repro_816_bundled_data_and_reset_must_not_lose_data`,
+`kps_repro_816_reordered_reset_before_data_must_not_lose_data`,
+`kps_816_deferred_reset_completes_when_the_application_drains`) assert that the receiver no longer
+has the stream right after applying the peer's reset. That is now true only after the peer answers our
+answering reset, so they run one round of that handshake (`complete_reset_handshake`) first. Their
+data-delivery assertions are unchanged. On the pristine upstream commit all 133 `rtc-sctp` lib tests
+pass; with Repair 4 all 139 pass (the six new ones cover the reset-state rules).
+
 Known gap: RFC 6525 section 5.2.1 duplicate-request handling (answer a retransmitted request without
 performing it again). Files: `rtc-sctp/src/association/mod.rs`, `stream.rs`, and unit tests in
 `association_test.rs`. The `rtc` regression test is `tests/data_channel_stream_id_reuse_rtc2rtc.rs`.
