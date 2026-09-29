@@ -707,3 +707,225 @@ fn many_small_chunks_bundle_within_mtu() {
         + raw_packets.len() * COMMON_HEADER_SIZE as usize;
     assert!(total >= min_expected);
 }
+
+// ---- Botster: a stream id is reusable only after both reset directions complete ----------
+//
+// Our reset request for a stream that the peer already reset is answered by the peer. Only a
+// success frees the id, and an answer that belongs to an old stream must never touch the
+// stream that took the id afterwards.
+
+/// An association with stream `id` registered, the peer's reset of it performed, and our own
+/// reset request `rsn` for it sent and unanswered.
+fn association_with_pending_reset(id: StreamId, rsn: u32) -> Association {
+    let mut a = Association::default();
+    assert!(
+        a.create_stream(id, true, PayloadProtocolIdentifier::Unknown)
+            .is_some()
+    );
+    let s = a.streams.get_mut(&id).unwrap();
+    s.incoming_reset = true;
+    s.outgoing_reset = OutgoingReset::Requested;
+    a.reconfigs.insert(
+        rsn,
+        ChunkReconfig {
+            param_a: Some(Box::new(ParamOutgoingResetRequest {
+                reconfig_request_sequence_number: rsn,
+                stream_identifiers: vec![id],
+                ..Default::default()
+            })),
+            param_b: None,
+        },
+    );
+    a
+}
+
+fn answer(rsn: u32, result: ReconfigResult) -> ChunkReconfig {
+    ChunkReconfig {
+        param_a: Some(Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: rsn,
+            result,
+        })),
+        param_b: None,
+    }
+}
+
+#[test]
+fn a_success_answer_frees_the_stream_id() -> Result<()> {
+    for result in [ReconfigResult::SuccessPerformed, ReconfigResult::SuccessNop] {
+        let mut a = association_with_pending_reset(3, 7);
+        a.handle_reconfig(&answer(7, result), Instant::now())?;
+        assert!(
+            !a.streams.contains_key(&3),
+            "{result:?} must complete both directions and unregister the stream"
+        );
+        assert!(a.reconfigs.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn an_unsuccessful_answer_does_not_free_the_stream_id() -> Result<()> {
+    for result in [
+        ReconfigResult::Denied,
+        ReconfigResult::ErrorWrongSsn,
+        ReconfigResult::ErrorRequestAlreadyInProgress,
+        ReconfigResult::ErrorBadSequenceNumber,
+        ReconfigResult::Unknown,
+    ] {
+        let mut a = association_with_pending_reset(3, 7);
+        a.handle_reconfig(&answer(7, result), Instant::now())?;
+        let s = a
+            .streams
+            .get(&3)
+            .unwrap_or_else(|| panic!("{result:?} must not unregister the stream"));
+        assert_eq!(
+            s.outgoing_reset,
+            OutgoingReset::Requested,
+            "{result:?} must not mark our outgoing reset performed"
+        );
+        assert!(a.reconfigs.is_empty(), "{result:?} ends the request");
+    }
+    Ok(())
+}
+
+/// New data on the id after the peer's reset opens a replacement stream. The old request is
+/// retired with the old stream, so its delayed answer changes nothing.
+fn association_with_replacement_stream(id: StreamId, rsn: u32) -> Result<Association> {
+    let mut a = association_with_pending_reset(id, rsn);
+    let first_data = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn + 1,
+        stream_identifier: id,
+        user_data: Bytes::from_static(b"new stream"),
+        ..Default::default()
+    };
+    a.handle_data(&first_data)?;
+    let s = a.streams.get(&id).expect("the data opened a replacement");
+    assert!(!s.incoming_reset, "the replacement is a new stream");
+    assert_eq!(s.outgoing_reset, OutgoingReset::NotRequested);
+    assert!(
+        a.reconfigs.is_empty(),
+        "the old stream's request is retired with the old stream"
+    );
+    Ok(a)
+}
+
+#[test]
+fn a_delayed_answer_for_the_old_stream_leaves_the_replacement_alone() -> Result<()> {
+    let mut a = association_with_replacement_stream(3, 7)?;
+    a.handle_reconfig(&answer(7, ReconfigResult::SuccessPerformed), Instant::now())?;
+    let s = a.streams.get(&3).expect("the replacement stays registered");
+    assert_eq!(s.outgoing_reset, OutgoingReset::NotRequested);
+    assert!(!s.incoming_reset);
+    Ok(())
+}
+
+#[test]
+fn a_delayed_answer_after_the_replacement_was_reset_does_not_close_it() -> Result<()> {
+    let mut a = association_with_replacement_stream(3, 7)?;
+    // The peer resets the replacement before the old answer arrives, and our answering
+    // reset for it is requested and unanswered.
+    let s = a.streams.get_mut(&3).unwrap();
+    s.incoming_reset = true;
+    s.outgoing_reset = OutgoingReset::Requested;
+
+    a.handle_reconfig(&answer(7, ReconfigResult::SuccessPerformed), Instant::now())?;
+    let s = a
+        .streams
+        .get(&3)
+        .expect("the old answer must not unregister the replacement");
+    assert_eq!(
+        s.outgoing_reset,
+        OutgoingReset::Requested,
+        "the old answer must not suppress the replacement's own answering reset"
+    );
+    Ok(())
+}
+
+#[test]
+fn retiring_one_stream_keeps_the_request_for_the_others() -> Result<()> {
+    let mut a = association_with_pending_reset(3, 7);
+    assert!(
+        a.create_stream(5, true, PayloadProtocolIdentifier::Unknown)
+            .is_some()
+    );
+    a.reconfigs.insert(
+        7,
+        ChunkReconfig {
+            param_a: Some(Box::new(ParamOutgoingResetRequest {
+                reconfig_request_sequence_number: 7,
+                stream_identifiers: vec![3, 5],
+                ..Default::default()
+            })),
+            param_b: None,
+        },
+    );
+    a.retire_pending_outgoing_reset(3);
+    let request = a.reconfigs[&7]
+        .param_a
+        .as_ref()
+        .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        .expect("the request stays");
+    assert_eq!(request.stream_identifiers, vec![5]);
+    Ok(())
+}
+
+/// An answering reset for a peer-initiated close is sent directly. The stream stays registered
+/// until the peer answers it, so a lost request or answer must be retransmitted: the
+/// retransmission timer is armed for it, fires, and the request goes out again. When the
+/// answer finally arrives the stream is unregistered.
+#[test]
+fn a_lost_answering_reset_is_retransmitted_until_answered() -> Result<()> {
+    let now = Instant::now();
+    let mut a = create_association(TransportConfig::default());
+    a.set_state(AssociationState::Established);
+    assert!(
+        a.create_stream(3, true, PayloadProtocolIdentifier::Unknown)
+            .is_some()
+    );
+
+    // The peer resets its outgoing direction of stream 3. Nothing is unread, so it is
+    // performed at once and we answer with our own reset of stream 3.
+    let peer_request = ChunkReconfig {
+        param_a: Some(Box::new(ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: 40,
+            sender_last_tsn: a.peer_last_tsn,
+            stream_identifiers: vec![3],
+            ..Default::default()
+        })),
+        param_b: None,
+    };
+    let sent = a.handle_reconfig(&peer_request, now)?;
+    assert!(!sent.is_empty(), "the answering reset and the response are sent");
+    let s = a.streams.get(&3).expect("registered until answered");
+    assert!(s.incoming_reset);
+    assert_eq!(s.outgoing_reset, OutgoingReset::Requested);
+    assert_eq!(a.reconfigs.len(), 1, "the answering request awaits its answer");
+
+    // The packets are lost. The next transmit pass must arm the retransmission timer.
+    a.gather_outbound(now);
+    let deadline = a
+        .timers
+        .get(Timer::Reconfig)
+        .expect("an unanswered answering reset must have its retransmission timer");
+
+    // The timer fires: the same request goes out again.
+    a.handle_timeout(deadline);
+    let (retransmitted, _) = a.gather_outbound(deadline);
+    assert!(
+        retransmitted.iter().any(|raw| raw.len() > 12 && raw[12] == 130),
+        "the answering reset request must be retransmitted"
+    );
+    assert!(a.streams.contains_key(&3));
+
+    // The answer to the retransmission arrives.
+    let rsn = *a.reconfigs.keys().next().expect("still awaiting the answer");
+    a.handle_reconfig(&answer(rsn, ReconfigResult::SuccessPerformed), deadline)?;
+    assert!(
+        !a.streams.contains_key(&3),
+        "both directions are reset, so the stream is unregistered"
+    );
+    assert!(a.reconfigs.is_empty());
+    Ok(())
+}
